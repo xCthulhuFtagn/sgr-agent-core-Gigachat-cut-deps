@@ -1,0 +1,2 @@
+[console_scripts]
+sgr = sgr_deep_research.__main__:main
