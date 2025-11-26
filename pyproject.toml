@@ -45,8 +45,8 @@ dependencies = [
     #"trafilatura>=1.6.0",
     #"youtube-transcript-api>=0.6.0",
     # Configuration and utilities
-    #"PyYAML>=6.0",
-    #"python-dateutil>=2.8.0",
+    "PyYAML>=6.0",
+    "python-dateutil>=2.8.0",
     #"pydantic-settings>=2.10.1",
     #"fastapi>=0.116.1",
     #"uvicorn>=0.35.0",
