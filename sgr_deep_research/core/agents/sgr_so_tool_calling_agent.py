@@ -1,11 +1,12 @@
 from typing import Type
 from warnings import warn
 
-from openai import AsyncOpenAI, pydantic_function_tool
+from openai import AsyncOpenAI
 
 from sgr_deep_research.core.agent_definition import ExecutionConfig, LLMConfig, PromptsConfig
-from .sgr_tool_calling_agent import SGRToolCallingAgent
-from sgr_deep_research.core.tools import BaseTool, ReasoningTool
+from sgr_deep_research.core.agents.sgr_tool_calling_agent import SGRToolCallingAgent
+from sgr_deep_research.core.base_tool import BaseTool
+from sgr_deep_research.core.tools import ReasoningTool
 
 
 class SGRSOToolCallingAgent(SGRToolCallingAgent):
@@ -38,64 +39,50 @@ class SGRSOToolCallingAgent(SGRToolCallingAgent):
         )
 
     async def _reasoning_phase(self) -> ReasoningTool:
-        # GigaChat/Legacy implementation
-        # Since GigaChat doesn't support response_format with Pydantic models,
-        # we simulate Structured Output by forcing a function call to ReasoningTool.
-
-        # Create function definition for ReasoningTool
-        tool_def = pydantic_function_tool(ReasoningTool, name=ReasoningTool.tool_name, description=ReasoningTool.description)
-        functions = [tool_def["function"]]
-
-        reasoning = None
-
-        messages = await self._prepare_context()
-
-        completion = await self.openai_client.chat.completions.create(
+        async with self.openai_client.chat.completions.stream(
             model=self.llm_config.model,
-            messages=messages,
+            messages=await self._prepare_context(),
             max_tokens=self.llm_config.max_tokens,
             temperature=self.llm_config.temperature,
-            functions=functions,
-            function_call={"name": ReasoningTool.tool_name}, # Force specific function
-            stream=False
-        )
-        
-        message = completion.choices[0].message
-        tool_args_str = None
-
-        if message.function_call and message.function_call.name == ReasoningTool.tool_name:
-            tool_args_str = message.function_call.arguments
-        elif message.tool_calls:
-                for tc in message.tool_calls:
-                    if tc.function.name == ReasoningTool.tool_name:
-                        tool_args_str = tc.function.arguments
-                        break
-        
-        if tool_args_str:
-            reasoning = ReasoningTool.model_validate_json(tool_args_str)
-        else:
-            error_msg = f"Model did not call {ReasoningTool.tool_name}. Content: {message.content}"
-            raise ValueError(f"Model failed to select ReasoningTool. Error: {error_msg}")
-
+            tools=await self._prepare_tools(),
+            tool_choice={"type": "function", "function": {"name": ReasoningTool.tool_name}},
+        ) as stream:
+            async for event in stream:
+                if event.type == "chunk":
+                    self.streaming_generator.add_chunk(event.chunk)
+            reasoning: ReasoningTool = (  # noqa
+                (await stream.get_final_completion()).choices[0].message.tool_calls[0].function.parsed_arguments  #
+            )
+        async with self.openai_client.chat.completions.stream(
+            model=self.llm_config.model,
+            response_format=ReasoningTool,
+            messages=await self._prepare_context(),
+            max_tokens=self.llm_config.max_tokens,
+            temperature=self.llm_config.temperature,
+        ) as stream:
+            async for event in stream:
+                if event.type == "chunk":
+                    self.streaming_generator.add_chunk(event.chunk)
+        reasoning: ReasoningTool = (await stream.get_final_completion()).choices[0].message.parsed
         tool_call_result = await reasoning(self._context)
-        
-        # Use legacy function_call format for history
         self.conversation.append(
             {
                 "role": "assistant",
-                "content": "",
-                "function_call": {
-                    "name": reasoning.tool_name,
-                    "arguments": {}, # Match original which passed empty dict
-                }
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": f"{self._context.iteration}-reasoning",
+                        "function": {
+                            "name": reasoning.tool_name,
+                            "arguments": "{}",
+                        },
+                    }
+                ],
             }
         )
         self.conversation.append(
-            {
-                "role": "function",
-                "name": reasoning.tool_name,
-                "content": tool_call_result
-            }
+            {"role": "tool", "content": tool_call_result, "tool_call_id": f"{self._context.iteration}-reasoning"}
         )
         self._log_reasoning(reasoning)
         return reasoning

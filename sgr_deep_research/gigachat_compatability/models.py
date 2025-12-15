@@ -43,7 +43,7 @@ class AgentStatesEnum(str, Enum):
     FINISH_STATES = {COMPLETED, FAILED, ERROR}
 
 
-class ResearchContext(BaseModel):
+class ResearchContextCounted(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
     current_step_reasoning: Any = None
@@ -61,6 +61,8 @@ class ResearchContext(BaseModel):
     clarification_received: asyncio.Event = Field(
         default_factory=asyncio.Event, description="Event for clarification synchronization"
     )
+    
+    tokens_used: int = Field(default=0, description="Number of tokens used")
 
     def agent_state(self) -> dict:
         return self.model_dump(exclude={"searches", "sources", "clarification_received"})

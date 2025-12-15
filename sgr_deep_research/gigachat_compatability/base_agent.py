@@ -7,28 +7,27 @@ from datetime import datetime
 from typing import Type
 
 from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionFunctionToolParam
+from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 
 from sgr_deep_research.core.agent_definition import ExecutionConfig, LLMConfig, PromptsConfig
-from sgr_deep_research.core.models import AgentStatesEnum, ResearchContext
+from sgr_deep_research.core.base_agent import BaseAgent
+from sgr_deep_research.gigachat_compatability.models import AgentStatesEnum, ResearchContextCounted
 from sgr_deep_research.core.services.prompt_loader import PromptLoader
 from sgr_deep_research.core.services.registry import AgentRegistry
 from sgr_deep_research.core.stream import OpenAIStreamingGenerator
-from sgr_deep_research.core.tools import (
-    BaseTool,
-    ClarificationTool,
-    ReasoningTool,
-)
+from sgr_deep_research.gigachat_compatability.base_tool import BaseTool_functional
+from sgr_deep_research.gigachat_compatability.tools.clarification_tool import ClarificationTool_functional
+from sgr_deep_research.gigachat_compatability.tools.reasoning_tool import ReasoningTool_functional
 
 
 class AgentRegistryMixin:
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if cls.__name__ not in ("BaseAgent",):
+        if cls.__name__ not in ("BaseAgent_functional",):
             AgentRegistry.register(cls, name=cls.name)
 
 
-class BaseAgent(AgentRegistryMixin):
+class BaseAgent_functional(BaseAgent, AgentRegistryMixin):
     """Base class for agents."""
 
     name: str = "base_agent"
@@ -40,7 +39,7 @@ class BaseAgent(AgentRegistryMixin):
         llm_config: LLMConfig,
         prompts_config: PromptsConfig,
         execution_config: ExecutionConfig,
-        toolkit: list[Type[BaseTool]] | None = None,
+        toolkit: list[Type[BaseTool_functional]] | None = None,
         **kwargs: dict,
     ):
         self.id = f"{self.name}_{uuid.uuid4()}"
@@ -49,7 +48,7 @@ class BaseAgent(AgentRegistryMixin):
         self.task = task
         self.toolkit = toolkit or []
 
-        self._context = ResearchContext()
+        self._context = ResearchContextCounted()
         self.conversation = []
         self.log = []
         self.max_iterations = execution_config.max_iterations
@@ -71,22 +70,34 @@ class BaseAgent(AgentRegistryMixin):
         self._context.state = AgentStatesEnum.RESEARCHING
         self.logger.info(f"✅ Clarification received: {clarifications[:2000]}...")
 
-    def _log_reasoning(self, result: ReasoningTool) -> None:
+    def _accumulate_tokens(self, usage) -> None:
+        """Store token usage reported by the LLM response."""
+        if usage is None:
+            return
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is None and isinstance(usage, dict):
+            total_tokens = usage.get("total_tokens")
+        if total_tokens is None:
+            return
+        self._context.tokens_used += total_tokens
+
+    def _log_reasoning(self, result: ReasoningTool_functional) -> None:
         next_step = result.remaining_steps[0] if result.remaining_steps else "Completing"
         self.logger.info(
             f"""
-    ###############################################
-    🤖 LLM RESPONSE DEBUG:
-       🧠 Reasoning Steps: {result.reasoning_steps}
-       📊 Current Situation: '{result.current_situation[:400]}...'
-       📋 Plan Status: '{result.plan_status[:400]}...'
-       🔍 Searches Done: {self._context.searches_used}
-       🔍 Clarifications Done: {self._context.clarifications_used}
-       ✅ Enough Data: {result.enough_data}
-       📝 Remaining Steps: {result.remaining_steps}
-       🏁 Task Completed: {result.task_completed}
-       ➡️ Next Step: {next_step}
-    ###############################################"""
+###############################################
+ REASONING DEBUG:
+    Reasoning Steps: {result.reasoning_steps}
+    Current Situation: '{result.current_situation[:400]}...'
+    Plan Status: '{result.plan_status[:400]}...'
+    Searches Done: {self._context.searches_used}
+    Clarifications Done: {self._context.clarifications_used}
+    Enough Data: {result.enough_data}
+    Remaining Steps: {result.remaining_steps}
+    Task Completed: {result.task_completed}
+   ➡ Next Step: {next_step}
+    Total tokens burned: {self._context.tokens_used}
+###############################################"""
         )
         self.log.append(
             {
@@ -97,14 +108,17 @@ class BaseAgent(AgentRegistryMixin):
             }
         )
 
-    def _log_tool_execution(self, tool: BaseTool, result: str):
+    def _log_tool_execution(self, tool: BaseTool_functional, result: str):
+        tool_name = tool.tool_name if tool is not None else "Unchosen"
+        tool_model = tool.model_dump_json(indent=2) if tool is not None else {"error": result}
         self.logger.info(
             f"""
 ###############################################
 🛠️ TOOL EXECUTION DEBUG:
-    🔧 Tool Name: {tool.tool_name}
-    📋 Tool Model: {tool.model_dump_json(indent=2)}
-    🔍 Result: '{result[:400]}...'
+    Tool Name: {tool_name}
+    Tool Model: {tool_model}
+    Result: '{result[:400]}...'
+    Total tokens burned: {self._context.tokens_used}
 ###############################################"""
         )
         self.log.append(
@@ -112,8 +126,8 @@ class BaseAgent(AgentRegistryMixin):
                 "step_number": self._context.iteration,
                 "timestamp": datetime.now().isoformat(),
                 "step_type": "tool_execution",
-                "tool_name": tool.tool_name,
-                "agent_tool_context": tool.model_dump(),
+                "tool_name": tool_name,
+                "agent_tool_context": tool_model,
                 "agent_tool_execution_result": result,
             }
         )
@@ -141,22 +155,22 @@ class BaseAgent(AgentRegistryMixin):
             *self.conversation,
         ]
 
-    async def _prepare_tools(self) -> list[ChatCompletionFunctionToolParam]:
+    async def _prepare_tools(self) -> list[ChatCompletionToolParam]:
         """Prepare available tools for current agent state and progress."""
         raise NotImplementedError("_prepare_tools must be implemented by subclass")
 
-    async def _reasoning_phase(self) -> ReasoningTool:
+    async def _reasoning_phase(self) -> ReasoningTool_functional | None:
         """Call LLM to decide next action based on current context."""
         raise NotImplementedError("_reasoning_phase must be implemented by subclass")
 
-    async def _select_action_phase(self, reasoning: ReasoningTool) -> BaseTool:
+    async def _select_action_phase(self, reasoning: ReasoningTool_functional) -> BaseTool_functional:
         """Select most suitable tool for the action decided in reasoning phase.
 
         Returns the tool suitable for the action.
         """
         raise NotImplementedError("_select_action_phase must be implemented by subclass")
 
-    async def _action_phase(self, tool: BaseTool) -> str:
+    async def _action_phase(self, tool: BaseTool_functional) -> str:
         """Call Tool for the action decided in select_action phase.
 
         Returns string or dumped json result of the tool execution.
@@ -185,7 +199,7 @@ class BaseAgent(AgentRegistryMixin):
                 action_tool = await self._select_action_phase(reasoning)
                 await self._action_phase(action_tool)
 
-                if isinstance(action_tool, ClarificationTool):
+                if isinstance(action_tool, ClarificationTool_functional):
                     self.logger.info("\n⏸️  Research paused - please answer questions")
                     self._context.state = AgentStatesEnum.WAITING_FOR_CLARIFICATION
                     self.streaming_generator.finish()
@@ -198,6 +212,6 @@ class BaseAgent(AgentRegistryMixin):
             self._context.state = AgentStatesEnum.FAILED
             traceback.print_exc()
         finally:
-            if self.streaming_generator is not None:
-                self.streaming_generator.finish()
+            # if self.streaming_generator is not None:
+            #     self.streaming_generator.finish()
             self._save_agent_log()
